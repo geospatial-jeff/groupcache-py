@@ -95,15 +95,8 @@ class ConsistentHash:
         # Binary search for appropriate replica (matching Go's sort.Search)
         idx = bisect.bisect_left(self.sorted_keys, hash_key)
 
-        # If we didn't find exact match, we need first element >= hash_key
-        if idx < len(self.sorted_keys) and self.sorted_keys[idx] == hash_key:
-            # Exact match
-            pass
-        elif idx < len(self.sorted_keys):
-            # Found insertion point, keys[idx] > hash_key, which is what we want
-            pass
-        else:
-            # All keys are < hash_key, wrap around to first node
+        # If idx == len, all keys are < hash_key, wrap to first replica
+        if idx == len(self.sorted_keys):
             idx = 0
 
         return self.ring[self.sorted_keys[idx]]
