@@ -1,7 +1,8 @@
+import asyncio
 import logging
 import zlib
 import bisect
-from typing import Any, OrderedDict
+from typing import Any, Callable, OrderedDict
 
 
 logging.basicConfig(level=logging.INFO)
@@ -107,3 +108,40 @@ class ConsistentHash:
     def _hash(self, key: str) -> int:
         """Hash function for consistent hashing - matches Go's CRC32"""
         return zlib.crc32(key.encode()) & 0xFFFFFFFF
+
+
+class ChannelSingleFlight:
+    __slots__ = ("_calls",)
+
+    def __init__(self):
+        # Store Future for coordination
+        self._calls: dict[str, asyncio.Future[Any]] = {}
+
+    async def do(self, key: str, fn: Callable) -> Any:
+        """Execute function with singleflight coordination (lock-free)"""
+
+        # Try to atomically insert our future
+        future = asyncio.Future[Any]()
+        existing = self._calls.setdefault(key, future)
+
+        if existing is not future:
+            # Someone else won the race, wait for their result
+            try:
+                return await existing
+            except Exception:
+                # Re-raise the exception from the original call
+                raise
+
+        # We won the race, execute the function
+        try:
+            result = await fn()
+            future.set_result(result)
+            return result
+        except Exception as e:
+            # Set exception on future so other waiters get it
+            if not future.done():
+                future.set_exception(e)
+            raise
+        finally:
+            # Clean up (atomic operation)
+            self._calls.pop(key, None)
