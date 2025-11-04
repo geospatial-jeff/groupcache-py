@@ -3,7 +3,8 @@ import logging
 import zlib
 import bisect
 import random
-from typing import Any, Callable, OrderedDict, Optional, Dict
+from functools import wraps, _make_key
+from typing import Any, Callable, OrderedDict
 
 
 logging.basicConfig(level=logging.INFO)
@@ -151,7 +152,7 @@ class ChannelSingleFlight:
 class MockPeerClient:
     """TODO: Replace with real calls to peers"""
 
-    async def get(self, peer_url: str, group: str, key: str) -> Optional[Any]:
+    async def get(self, peer_url: str, group: str, key: str) -> Any | None:
         await asyncio.sleep(0.001)  # Simulate network latency
         return None
 
@@ -162,7 +163,7 @@ class GroupCacheCluster:
     def __init__(self, self_url: str):
         self.self_url = self_url
         self.consistent_hash = ConsistentHash()
-        self.groups: Dict[str, "GroupCacheGroup"] = {}
+        self.groups: dict[str, "GroupCacheGroup"] = {}
         self.peer_client = MockPeerClient()
 
     def set_peers(self, peer_urls: list[str]) -> None:
@@ -197,7 +198,7 @@ class GroupCacheCluster:
             )
         return self.groups[name]
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get cluster statistics"""
         stats = {
             "peers": len(self.consistent_hash.get_nodes()),
@@ -229,10 +230,11 @@ class GroupCacheGroup:
         # Metrics
         self.peer_requests = 0
         self.peer_hits = 0
+        self.source_loads = 0
         self.main_cache_hits = 0
         self.hot_cache_hits = 0
 
-    def _lookup_cache(self, key: str) -> Optional[Any]:
+    def _lookup_cache(self, key: str) -> Any | None:
         """Look up key in both mainCache and hotCache (Go groupcache pattern)"""
 
         # Check mainCache first (authoritative data)
@@ -249,23 +251,23 @@ class GroupCacheGroup:
 
         return None
 
-    async def get(self, key: str) -> Optional[Any]:
-        """Get value from cache (returns None if not cached)"""
+    async def get(self, key: str, loader: Callable | None = None) -> Any | None:
+        """Get value with peer coordination (Go groupcache semantics)"""
 
         # 1. Look up in both caches (mainCache + hotCache)
         cached_value = self._lookup_cache(key)
         if cached_value is not None:
             return cached_value
 
-        # 2. Use singleflight to prevent duplicate peer requests
-        return await self.singleflight.do(key, lambda: self._load_from_peer(key))
+        # 2. Use singleflight to prevent duplicate loads
+        return await self.singleflight.do(key, lambda: self._load_key(key, loader))
 
     def _populate_cache(self, key: str, value: Any, cache: LRUCache) -> None:
         """Populate cache with value (Go groupcache pattern)"""
         cache.set(key, value)
 
-    async def _load_from_peer(self, key: str) -> Optional[Any]:
-        """Try to load key from peer if we're not authoritative"""
+    async def _load_key(self, key: str, loader: Callable | None) -> Any | None:
+        """Load key from peer or source (Go groupcache semantics)"""
 
         # Double-check cache (singleflight pattern from Go)
         cached_value = self._lookup_cache(key)
@@ -276,38 +278,54 @@ class GroupCacheGroup:
         owner_peer = self.cluster.consistent_hash.get_node(key)
 
         if owner_peer is None or owner_peer == self.cluster.self_url:
-            # We are authoritative for this key - no peer to ask
-            return None
-
-        # Request from peer (we're not authoritative)
-        try:
-            self.peer_requests += 1
-            value = await self.cluster.peer_client.get(owner_peer, self.name, key)
-            if value is not None:
-                self.peer_hits += 1
-                # Store in hotCache with probability (popular remote data)
-                # Go uses 10% probability to avoid hotCache bloat
-                if random.randint(1, 10) == 1:  # 10% chance
-                    self._populate_cache(key, value, self.hot_cache)
-
+            # We are authoritative for this key - load from source
+            if loader:
+                self.source_loads += 1
+                value = await loader()
+                if value is not None:
+                    # Store in mainCache (we're authoritative)
+                    self._populate_cache(key, value, self.main_cache)
                 return value
-        except Exception as e:
-            logger.warning(f"Peer request failed: {e}")
+            return None
+        else:
+            # Request from peer (we're not authoritative)
+            try:
+                self.peer_requests += 1
+                value = await self.cluster.peer_client.get(owner_peer, self.name, key)
+                if value is not None:
+                    self.peer_hits += 1
+                    # Store in hot cache with probability (popular remote data)
+                    # Go uses 10% probability to avoid hot cache bloat
+                    if random.randint(1, 10) == 1:  # 10% chance
+                        self._populate_cache(key, value, self.hot_cache)
 
-        return None
+                    return value
+            except Exception as e:
+                logger.warning(f"Peer request failed: {e}")
+
+            # Fallback to local load if peer fails
+            if loader:
+                self.source_loads += 1
+                value = await loader()
+                if value is not None:
+                    # Store in main cache (fallback makes us authoritative)
+                    self._populate_cache(key, value, self.main_cache)
+                return value
+
+            return None
 
     async def set(self, key: str, value: Any) -> None:
         """Set value in appropriate cache based on ownership"""
         owner_peer = self.cluster.consistent_hash.get_node(key)
 
         if owner_peer is None or owner_peer == self.cluster.self_url:
-            # We own this key - store in mainCache
+            # We own this key - store in main cache
             self._populate_cache(key, value, self.main_cache)
         else:
-            # We don't own this key - store in hotCache
+            # We don't own this key - store in hot cache
             self._populate_cache(key, value, self.hot_cache)
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get group statistics (Go groupcache style)"""
         main_stats = self.main_cache.stats()
         hot_stats = self.hot_cache.stats()
@@ -319,6 +337,78 @@ class GroupCacheGroup:
             "hot_cache_hits": self.hot_cache_hits,
             "peer_requests": self.peer_requests,
             "peer_hits": self.peer_hits,
+            "source_loads": self.source_loads,
             "peer_hit_rate": self.peer_hits / max(self.peer_requests, 1),
             "total_cache_hits": self.main_cache_hits + self.hot_cache_hits,
         }
+
+
+def _make_cache_key(func_name: str, *args, **kwargs) -> str:
+    """Generate cache key using functools._make_key (battle-tested)"""
+    # Prepend function name to args for uniqueness across functions
+    key_args = (func_name,) + args
+
+    # Use functools._make_key for optimal performance
+    key = _make_key(key_args, kwargs, typed=False)
+
+    # Convert to string for our cache (functools returns various types)
+    if isinstance(key, (str, int)):
+        return str(key)
+    else:
+        return str(hash(key))
+
+
+# Global cluster instance
+_global_cluster: GroupCacheCluster | None = None
+
+
+def configure_cluster(
+    self_url: str, peer_urls: list[str] | None = None
+) -> GroupCacheCluster:
+    """Configure the global GroupCache cluster (singleton pattern)"""
+    global _global_cluster
+
+    _global_cluster = GroupCacheCluster(self_url)
+    if peer_urls:
+        _global_cluster.set_peers(peer_urls)
+
+    return _global_cluster
+
+
+def get_cluster() -> GroupCacheCluster | None:
+    """Get the global cluster instance"""
+    return _global_cluster
+
+
+def cached(group: str):
+    """Decorator for distributed caching (group must already exist)"""
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(*args, **kwargs) -> Any:
+            if not _global_cluster:
+                raise RuntimeError(
+                    "GroupCache cluster not configured. Call configure_cluster() first."
+                )
+
+            # Get existing cache group (will raise if doesn't exist)
+            cache_group = _global_cluster.get_group(group)
+
+            # Generate cache key
+            key = _make_cache_key(func.__name__, *args, **kwargs)
+
+            # Try to get from distributed cache
+            cached_value = await cache_group.get(key)
+            if cached_value is not None:
+                return cached_value
+
+            # Cache miss - execute function and cache result
+            async def loader():
+                result = await func(*args, **kwargs)
+                return result
+
+            return await cache_group.get(key, loader)
+
+        return wrapper
+
+    return decorator
