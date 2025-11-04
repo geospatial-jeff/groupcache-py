@@ -2,7 +2,8 @@ import asyncio
 import logging
 import zlib
 import bisect
-from typing import Any, Callable, OrderedDict
+import random
+from typing import Any, Callable, OrderedDict, Optional, Dict
 
 
 logging.basicConfig(level=logging.INFO)
@@ -145,3 +146,179 @@ class ChannelSingleFlight:
         finally:
             # Clean up (atomic operation)
             self._calls.pop(key, None)
+
+
+class MockPeerClient:
+    """TODO: Replace with real calls to peers"""
+
+    async def get(self, peer_url: str, group: str, key: str) -> Optional[Any]:
+        await asyncio.sleep(0.001)  # Simulate network latency
+        return None
+
+
+class GroupCacheCluster:
+    """GroupCache cluster management"""
+
+    def __init__(self, self_url: str):
+        self.self_url = self_url
+        self.consistent_hash = ConsistentHash()
+        self.groups: Dict[str, "GroupCacheGroup"] = {}
+        self.peer_client = MockPeerClient()
+
+    def set_peers(self, peer_urls: list[str]) -> None:
+        """Configure cluster peers"""
+        # Clear existing nodes
+        for node in self.consistent_hash.get_nodes():
+            self.consistent_hash.remove_node(node)
+
+        # Add all peers including self
+        all_peers = set(peer_urls + [self.self_url])
+        for peer in all_peers:
+            self.consistent_hash.add_node(peer)
+
+        logger.info(f"Configured cluster with {len(all_peers)} peers")
+
+    def create_group(self, name: str, max_size: int = 10000) -> "GroupCacheGroup":
+        """Create a cache group (raises if group already exists)"""
+        if name in self.groups:
+            raise ValueError(
+                f"Group '{name}' already exists. Use get_group() to access existing groups."
+            )
+
+        self.groups[name] = GroupCacheGroup(name=name, cluster=self, max_size=max_size)
+        logger.info(f"Created cache group '{name}' with max_size={max_size}")
+        return self.groups[name]
+
+    def get_group(self, name: str) -> "GroupCacheGroup":
+        """Get an existing cache group (raises if group doesn't exist)"""
+        if name not in self.groups:
+            raise ValueError(
+                f"Group '{name}' does not exist. Use create_group() to create it first."
+            )
+        return self.groups[name]
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cluster statistics"""
+        stats = {
+            "peers": len(self.consistent_hash.get_nodes()),
+            "groups": len(self.groups),
+            "self_url": self.self_url,
+        }
+
+        for name, group in self.groups.items():
+            stats[f"group_{name}"] = group.get_stats()
+
+        return stats
+
+
+class GroupCacheGroup:
+    """A cache group within the cluster (matches Go groupcache semantics)"""
+
+    def __init__(self, name: str, cluster: GroupCacheCluster, max_size: int = 10000):
+        self.name = name
+        self.cluster = cluster
+
+        # Go groupcache cache architecture:
+        # mainCache: authoritative data (keys we own via consistent hashing)
+        # hotCache: popular remote data (keys owned by other peers)
+        self.main_cache = LRUCache(max_size)  # Keys this peer is authoritative for
+        self.hot_cache = LRUCache(max_size // 10)  # Popular keys from other peers
+
+        self.singleflight = ChannelSingleFlight()
+
+        # Metrics
+        self.peer_requests = 0
+        self.peer_hits = 0
+        self.main_cache_hits = 0
+        self.hot_cache_hits = 0
+
+    def _lookup_cache(self, key: str) -> Optional[Any]:
+        """Look up key in both mainCache and hotCache (Go groupcache pattern)"""
+
+        # Check mainCache first (authoritative data)
+        value = self.main_cache.get(key)
+        if value is not None:
+            self.main_cache_hits += 1
+            return value
+
+        # Check hotCache second (popular remote data)
+        value = self.hot_cache.get(key)
+        if value is not None:
+            self.hot_cache_hits += 1
+            return value
+
+        return None
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache (returns None if not cached)"""
+
+        # 1. Look up in both caches (mainCache + hotCache)
+        cached_value = self._lookup_cache(key)
+        if cached_value is not None:
+            return cached_value
+
+        # 2. Use singleflight to prevent duplicate peer requests
+        return await self.singleflight.do(key, lambda: self._load_from_peer(key))
+
+    def _populate_cache(self, key: str, value: Any, cache: LRUCache) -> None:
+        """Populate cache with value (Go groupcache pattern)"""
+        cache.set(key, value)
+
+    async def _load_from_peer(self, key: str) -> Optional[Any]:
+        """Try to load key from peer if we're not authoritative"""
+
+        # Double-check cache (singleflight pattern from Go)
+        cached_value = self._lookup_cache(key)
+        if cached_value is not None:
+            return cached_value
+
+        # Determine key owner via consistent hashing
+        owner_peer = self.cluster.consistent_hash.get_node(key)
+
+        if owner_peer is None or owner_peer == self.cluster.self_url:
+            # We are authoritative for this key - no peer to ask
+            return None
+
+        # Request from peer (we're not authoritative)
+        try:
+            self.peer_requests += 1
+            value = await self.cluster.peer_client.get(owner_peer, self.name, key)
+            if value is not None:
+                self.peer_hits += 1
+                # Store in hotCache with probability (popular remote data)
+                # Go uses 10% probability to avoid hotCache bloat
+                if random.randint(1, 10) == 1:  # 10% chance
+                    self._populate_cache(key, value, self.hot_cache)
+
+                return value
+        except Exception as e:
+            logger.warning(f"Peer request failed: {e}")
+
+        return None
+
+    async def set(self, key: str, value: Any) -> None:
+        """Set value in appropriate cache based on ownership"""
+        owner_peer = self.cluster.consistent_hash.get_node(key)
+
+        if owner_peer is None or owner_peer == self.cluster.self_url:
+            # We own this key - store in mainCache
+            self._populate_cache(key, value, self.main_cache)
+        else:
+            # We don't own this key - store in hotCache
+            self._populate_cache(key, value, self.hot_cache)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get group statistics (Go groupcache style)"""
+        main_stats = self.main_cache.stats()
+        hot_stats = self.hot_cache.stats()
+
+        return {
+            "main_cache": main_stats,
+            "hot_cache": hot_stats,
+            "main_cache_hits": self.main_cache_hits,
+            "hot_cache_hits": self.hot_cache_hits,
+            "peer_requests": self.peer_requests,
+            "peer_hits": self.peer_hits,
+            "peer_hit_rate": self.peer_hits / max(self.peer_requests, 1),
+            "total_cache_hits": self.main_cache_hits + self.hot_cache_hits,
+        }
