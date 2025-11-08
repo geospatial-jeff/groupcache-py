@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock, Mock, patch
 from groupcache.groupcache import GroupCacheCluster, GroupCacheGroup
 
 
@@ -200,3 +201,284 @@ def test_cluster_default_max_size():
     # Should use default value of 10000
     assert group.main_cache.max_size == 10000
     assert group.hot_cache.max_size == 1000  # 10% of main cache
+
+
+# HTTP Unit Tests
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.GroupCacheHTTPServer")
+@patch("groupcache.groupcache.GroupCacheHTTPClient")
+async def test_cluster_http_components_initialization(
+    mock_client_class, mock_server_class
+):
+    """Test cluster initializes HTTP components with correct parameters"""
+    mock_server = Mock()
+    mock_client = Mock()
+    mock_server_class.return_value = mock_server
+    mock_client_class.return_value = mock_client
+
+    cluster = GroupCacheCluster(self_url="http://localhost:8080", base_path="/custom/")
+
+    # Verify HTTP server was created with correct parameters
+    mock_server_class.assert_called_once_with("/custom/", "http://localhost:8080")
+    assert cluster.http_server is mock_server
+
+    # Verify HTTP client was created with correct parameters
+    mock_client_class.assert_called_once_with("/custom/")
+    assert cluster.peer_client is mock_client
+
+
+@pytest.mark.asyncio
+async def test_cluster_start_http_server_sets_handler():
+    """Test starting HTTP server sets the correct handler"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock the server start method
+    cluster.http_server.start = AsyncMock()
+
+    await cluster.start_http_server()
+
+    # Verify handler was set and server was started
+    assert cluster.http_server.get_handler == cluster._handle_peer_request
+    cluster.http_server.start.assert_called_once()
+    assert cluster._server_started
+
+
+@pytest.mark.asyncio
+async def test_cluster_start_http_server_idempotent():
+    """Test starting HTTP server multiple times is safe"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock the server start method
+    cluster.http_server.start = AsyncMock()
+    cluster._server_started = True
+
+    await cluster.start_http_server()
+
+    # Should not call start again
+    cluster.http_server.start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cluster_close_calls_cleanup():
+    """Test cluster close calls cleanup on components"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock the cleanup methods
+    cluster.peer_client.close = AsyncMock()
+    cluster.http_server.stop = AsyncMock()
+    cluster._server_started = True
+
+    await cluster.close()
+
+    # Verify cleanup was called
+    cluster.peer_client.close.assert_called_once()
+    cluster.http_server.stop.assert_called_once()
+    assert not cluster._server_started
+
+
+@pytest.mark.asyncio
+async def test_cluster_handle_peer_request_unknown_group():
+    """Test peer request handler returns None for unknown groups"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    result = await cluster._handle_peer_request("unknown_group", "test_key")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cluster_handle_peer_request_cache_hit():
+    """Test peer request handler serves from cache"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Create group and populate cache
+    group = cluster.create_group("test_group", dummy_loader)
+    group.main_cache.set("test_key", "cached_value")
+
+    result = await cluster._handle_peer_request("test_group", "test_key")
+
+    assert result == "cached_value"
+    assert group.main_cache_hits == 1
+
+
+@pytest.mark.asyncio
+async def test_cluster_handle_peer_request_cache_miss_loads():
+    """Test peer request handler loads from source on cache miss"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock loader
+    mock_loader = Mock(return_value="loaded_value")
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await cluster._handle_peer_request("test_group", "test_key")
+
+    assert result == "loaded_value"
+    assert group.source_loads == 1
+    mock_loader.assert_called_once_with("test_key")
+    # Should cache the result
+    assert group.main_cache.get("test_key") == "loaded_value"
+
+
+@pytest.mark.asyncio
+async def test_cluster_handle_peer_request_async_loader():
+    """Test peer request handler works with async loaders"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock async loader
+    mock_loader = AsyncMock(return_value="async_value")
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await cluster._handle_peer_request("test_group", "test_key")
+
+    assert result == "async_value"
+    assert group.source_loads == 1
+    mock_loader.assert_called_once_with("test_key")
+
+
+@pytest.mark.asyncio
+async def test_cluster_handle_peer_request_loader_exception():
+    """Test peer request handler handles loader exceptions"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock failing loader
+    mock_loader = Mock(side_effect=ValueError("Load failed"))
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await cluster._handle_peer_request("test_group", "test_key")
+
+    assert result is None
+    assert group.source_loads == 1
+    mock_loader.assert_called_once_with("test_key")
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.ConsistentHash.get_node")
+async def test_group_uses_peer_client_for_remote_keys(mock_get_node):
+    """Test group uses HTTP client for keys owned by peers"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+    cluster.set_peers(["http://peer1:8080"])
+
+    # Mock consistent hash to return peer URL
+    mock_get_node.return_value = "http://peer1:8080"
+
+    # Mock the HTTP client
+    cluster.peer_client.get = AsyncMock(return_value="peer_value")
+
+    group = cluster.create_group("test_group", dummy_loader)
+
+    result = await group.get("remote_key")
+
+    assert result == "peer_value"
+    assert group.peer_requests == 1
+    assert group.peer_hits == 1
+    cluster.peer_client.get.assert_called_once_with(
+        "http://peer1:8080", "test_group", "remote_key"
+    )
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.ConsistentHash.get_node")
+async def test_group_uses_local_loader_for_owned_keys(mock_get_node):
+    """Test group uses local loader for keys it owns"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+    cluster.set_peers(["http://peer1:8080"])
+
+    # Mock consistent hash to return self URL
+    mock_get_node.return_value = "http://localhost:8080"
+
+    # Mock the HTTP client (should not be called)
+    cluster.peer_client.get = AsyncMock()
+
+    # Mock loader
+    mock_loader = Mock(return_value="local_value")
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await group.get("local_key")
+
+    assert result == "local_value"
+    assert group.peer_requests == 0  # No peer requests
+    assert group.source_loads == 1
+    cluster.peer_client.get.assert_not_called()
+    mock_loader.assert_called_once_with("local_key")
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.ConsistentHash.get_node")
+async def test_group_fallback_on_peer_failure(mock_get_node):
+    """Test group falls back to local loader when peer request fails"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+    cluster.set_peers(["http://peer1:8080"])
+
+    # Mock consistent hash to return peer URL
+    mock_get_node.return_value = "http://peer1:8080"
+
+    # Mock HTTP client to fail
+    cluster.peer_client.get = AsyncMock(side_effect=Exception("Network error"))
+
+    # Mock loader for fallback
+    mock_loader = Mock(return_value="fallback_value")
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await group.get("failing_key")
+
+    assert result == "fallback_value"
+    assert group.peer_requests == 1
+    assert group.peer_hits == 0
+    assert group.source_loads == 1
+    cluster.peer_client.get.assert_called_once_with(
+        "http://peer1:8080", "test_group", "failing_key"
+    )
+    mock_loader.assert_called_once_with("failing_key")
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.ConsistentHash.get_node")
+async def test_group_hot_cache_population(mock_get_node):
+    """Test group populates hot cache for peer values"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock consistent hash to return peer URL
+    mock_get_node.return_value = "http://peer1:8080"
+
+    # Mock HTTP client
+    cluster.peer_client.get = AsyncMock(return_value="peer_value")
+
+    # Mock random to always trigger hot cache population (10% chance normally)
+    with patch("random.randint", return_value=1):  # 1 out of 10 triggers population
+        group = cluster.create_group("test_group", dummy_loader)
+
+        result = await group.get("hot_key")
+
+        assert result == "peer_value"
+        assert group.peer_hits == 1
+        # Should be in hot cache now
+        assert group.hot_cache.get("hot_key") == "peer_value"
+
+
+@pytest.mark.asyncio
+@patch("groupcache.groupcache.ConsistentHash.get_node")
+async def test_group_peer_not_found_returns_none(mock_get_node):
+    """Test group handles peer returning None"""
+    cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Mock consistent hash to return peer URL
+    mock_get_node.return_value = "http://peer1:8080"
+
+    # Mock HTTP client to return None
+    cluster.peer_client.get = AsyncMock(return_value=None)
+
+    # Mock loader to also return None
+    mock_loader = Mock(return_value=None)
+    group = cluster.create_group("test_group", mock_loader)
+
+    result = await group.get("missing_key")
+
+    assert result is None
+    assert group.peer_requests == 1
+    assert group.peer_hits == 0
+    cluster.peer_client.get.assert_called_once_with(
+        "http://peer1:8080", "test_group", "missing_key"
+    )
+    mock_loader.assert_called_once_with("missing_key")
