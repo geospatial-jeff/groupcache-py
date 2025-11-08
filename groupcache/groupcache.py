@@ -493,7 +493,10 @@ def cached(group: str):
                         if asyncio.iscoroutinefunction(registered_func):
                             return await registered_func(*parsed_args, **parsed_kwargs)
                         else:
-                            return registered_func(*parsed_args, **parsed_kwargs)
+                            # Run sync function in thread to avoid blocking event loop
+                            return await asyncio.to_thread(
+                                registered_func, *parsed_args, **parsed_kwargs
+                            )
 
                     except Exception as e:
                         logger.error(f"Error in group loader for {group}: {e}")
