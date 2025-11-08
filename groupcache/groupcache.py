@@ -441,10 +441,16 @@ _global_cluster: GroupCacheCluster | None = None
 
 
 async def configure_cluster(
-    self_url: str, peer_urls: list[str] | None = None, auto_start_server: bool = True
+    self_url: str | None = None,
+    peer_urls: list[str] | None = None,
+    auto_start_server: bool = True,
 ) -> GroupCacheCluster:
     """Configure the global GroupCache cluster (singleton pattern)"""
     global _global_cluster
+
+    # Use localhost default for single-peer setups
+    if self_url is None:
+        self_url = "http://localhost:8080"
 
     _global_cluster = GroupCacheCluster(self_url)
     if peer_urls:
