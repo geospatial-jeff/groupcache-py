@@ -53,17 +53,20 @@ def test_make_cache_key_with_hashable_args():
     assert key1 != key3
 
 
-def test_configure_cluster():
+@pytest.mark.asyncio
+async def test_configure_cluster():
     """Test cluster configuration"""
     # Configure without peers
-    cluster = configure_cluster("localhost:8081")
+    cluster = await configure_cluster("localhost:8081", auto_start_server=False)
     assert cluster is not None
     assert cluster.self_url == "localhost:8081"
     assert get_cluster() is cluster
     assert len(cluster.consistent_hash.get_nodes()) == 0
 
     # Configure with peers
-    cluster2 = configure_cluster("localhost:8081", ["localhost:8082", "localhost:8083"])
+    cluster2 = await configure_cluster(
+        "localhost:8081", ["localhost:8082", "localhost:8083"], auto_start_server=False
+    )
     assert cluster2 is get_cluster()  # Should return same instance
     assert len(cluster2.consistent_hash.get_nodes()) == 3
 
@@ -76,9 +79,8 @@ def test_get_cluster_before_configure():
 @pytest.mark.asyncio
 async def test_cached_decorator_basic():
     """Test basic @cached decorator functionality"""
-    # Configure cluster and create group
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("test_group", max_size=100)
+    # Configure cluster - let decorator create group
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     call_count = 0
 
@@ -108,8 +110,7 @@ async def test_cached_decorator_basic():
 @pytest.mark.asyncio
 async def test_cached_decorator_with_kwargs():
     """Test @cached decorator with keyword arguments"""
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("test_group", max_size=100)
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     call_count = 0
 
@@ -143,19 +144,18 @@ async def test_cached_decorator_with_kwargs():
 @pytest.mark.asyncio
 async def test_cached_decorator_multiple_functions():
     """Test @cached decorator on multiple functions"""
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("math", max_size=100)
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     add_count = 0
     mult_count = 0
 
-    @cached(group="math")
+    @cached(group="add_group")
     async def add(x: int, y: int) -> int:
         nonlocal add_count
         add_count += 1
         return x + y
 
-    @cached(group="math")
+    @cached(group="multiply_group")
     async def multiply(x: int, y: int) -> int:
         nonlocal mult_count
         mult_count += 1
@@ -183,8 +183,7 @@ async def test_cached_decorator_multiple_functions():
 @pytest.mark.asyncio
 async def test_cached_decorator_none_values():
     """Test @cached decorator with None return values"""
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("test_group", max_size=100)
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     call_count = 0
 
@@ -230,24 +229,26 @@ async def test_cached_decorator_no_cluster_configured():
 
 
 @pytest.mark.asyncio
-async def test_cached_decorator_group_not_exist():
-    """Test @cached decorator error when group doesn't exist"""
-    configure_cluster("localhost:8081")
-    # Don't create group
+async def test_cached_decorator_auto_creates_group():
+    """Test @cached decorator auto-creates group when it doesn't exist"""
+    cluster = await configure_cluster("localhost:8081", auto_start_server=False)
+    # Verify group doesn't exist initially
+    assert "auto_created_group" not in cluster.groups
 
-    @cached(group="nonexistent_group")
+    @cached(group="auto_created_group")
     async def some_function():
         return "value"
 
-    with pytest.raises(ValueError, match="does not exist"):
-        await some_function()
+    # First call should auto-create the group
+    result = await some_function()
+    assert result == "value"
+    assert "auto_created_group" in cluster.groups
 
 
 @pytest.mark.asyncio
 async def test_cached_decorator_concurrent_calls():
     """Test @cached decorator with concurrent calls"""
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("test_group", max_size=100)
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     call_count = 0
 
@@ -272,8 +273,9 @@ async def test_cached_decorator_concurrent_calls():
 @pytest.mark.asyncio
 async def test_cached_decorator_with_cluster_peers():
     """Test @cached decorator with peer configuration"""
-    cluster = configure_cluster("localhost:8081", ["localhost:8082", "localhost:8083"])
-    cluster.create_group("distributed", max_size=100)
+    cluster = await configure_cluster(
+        "localhost:8081", ["localhost:8082", "localhost:8083"], auto_start_server=False
+    )
 
     call_count = 0
 
@@ -315,8 +317,7 @@ async def test_cached_decorator_with_cluster_peers():
 @pytest.mark.asyncio
 async def test_cached_decorator_function_metadata():
     """Test that @cached preserves function metadata"""
-    cluster = configure_cluster("localhost:8081")
-    cluster.create_group("test_group", max_size=100)
+    await configure_cluster("localhost:8081", auto_start_server=False)
 
     @cached(group="test_group")
     async def documented_function(x: int) -> int:
@@ -332,14 +333,17 @@ async def test_cached_decorator_function_metadata():
     assert result == 10
 
 
-def test_configure_cluster_updates_existing():
+@pytest.mark.asyncio
+async def test_configure_cluster_updates_existing():
     """Test that configure_cluster updates existing cluster"""
     # First configuration
-    cluster1 = configure_cluster("localhost:8081")
-    cluster1.create_group("group1")
+    cluster1 = await configure_cluster("localhost:8081", auto_start_server=False)
+    cluster1.create_group("group1", lambda key: f"value_{key}")
 
     # Second configuration - should replace cluster
-    cluster2 = configure_cluster("localhost:9999", ["peer1", "peer2"])
+    cluster2 = await configure_cluster(
+        "localhost:9999", ["peer1", "peer2"], auto_start_server=False
+    )
 
     # Should be different instance
     assert cluster2 is not cluster1

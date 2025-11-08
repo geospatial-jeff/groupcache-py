@@ -1,10 +1,15 @@
 import asyncio
+import pickle
+import base64
 import logging
 import zlib
 import bisect
 import random
-from functools import wraps, _make_key
+from functools import wraps
 from typing import Any, Callable, OrderedDict
+
+from .http_server import GroupCacheHTTPServer
+from .http_client import GroupCacheHTTPClient
 
 
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +31,7 @@ class LRUCache:
     def get(self, key: str) -> Any | None:
         try:
             value = self.cache[key]
-            # Move to end (most recently used) - O(1) operation
+            # Move to end (most recently used)
             self.cache.move_to_end(key)
             self._hits += 1
             return value
@@ -36,7 +41,7 @@ class LRUCache:
 
     def set(self, key: str, value: Any) -> None:
         if key in self.cache:
-            # Update existing - O(1)
+            # Update existing
             self.cache[key] = value
             self.cache.move_to_end(key)
         else:
@@ -44,7 +49,7 @@ class LRUCache:
             self.cache[key] = value
             self._size += 1
 
-            # Evict oldest if over capacity - O(1)
+            # Evict oldest if over capacity
             # max_size = None means unlimited
             if self.max_size is not None and self._size > self.max_size:
                 self.cache.popitem(last=False)
@@ -72,7 +77,6 @@ class ConsistentHash:
 
     def add_node(self, node: str) -> None:
         for i in range(self.replicas):
-            # Match Go's key format: strconv.Itoa(i) + key
             key = self._hash(f"{i}{node}")
             self.ring[key] = node
 
@@ -81,7 +85,6 @@ class ConsistentHash:
 
     def remove_node(self, node: str) -> None:
         for i in range(self.replicas):
-            # Match Go's key format: strconv.Itoa(i) + key
             key = self._hash(f"{i}{node}")
             if key in self.ring:
                 del self.ring[key]
@@ -116,13 +119,10 @@ class ChannelSingleFlight:
     __slots__ = ("_calls",)
 
     def __init__(self):
-        # Store Future for coordination
         self._calls: dict[str, asyncio.Future[Any]] = {}
 
     async def do(self, key: str, fn: Callable) -> Any:
         """Execute function with singleflight coordination (lock-free)"""
-
-        # Try to atomically insert our future
         future = asyncio.Future[Any]()
         existing = self._calls.setdefault(key, future)
 
@@ -149,22 +149,17 @@ class ChannelSingleFlight:
             self._calls.pop(key, None)
 
 
-class MockPeerClient:
-    """TODO: Replace with real calls to peers"""
-
-    async def get(self, peer_url: str, group: str, key: str) -> Any | None:
-        await asyncio.sleep(0.001)  # Simulate network latency
-        return None
-
-
 class GroupCacheCluster:
     """GroupCache cluster management"""
 
-    def __init__(self, self_url: str):
+    def __init__(self, self_url: str, base_path: str = "/_groupcache/"):
         self.self_url = self_url
+        self.base_path = base_path
         self.consistent_hash = ConsistentHash()
         self.groups: dict[str, "GroupCacheGroup"] = {}
-        self.peer_client = MockPeerClient()
+        self.peer_client = GroupCacheHTTPClient(base_path)
+        self.http_server = GroupCacheHTTPServer(base_path, self_url)
+        self._server_started = False
 
     def set_peers(self, peer_urls: list[str]) -> None:
         """Configure cluster peers"""
@@ -179,14 +174,18 @@ class GroupCacheCluster:
 
         logger.info(f"Configured cluster with {len(all_peers)} peers")
 
-    def create_group(self, name: str, max_size: int = 10000) -> "GroupCacheGroup":
+    def create_group(
+        self, name: str, loader: Callable[[str], Any], max_size: int = 10000
+    ) -> "GroupCacheGroup":
         """Create a cache group (raises if group already exists)"""
         if name in self.groups:
             raise ValueError(
                 f"Group '{name}' already exists. Use get_group() to access existing groups."
             )
 
-        self.groups[name] = GroupCacheGroup(name=name, cluster=self, max_size=max_size)
+        self.groups[name] = GroupCacheGroup(
+            name=name, cluster=self, loader=loader, max_size=max_size
+        )
         logger.info(f"Created cache group '{name}' with max_size={max_size}")
         return self.groups[name]
 
@@ -211,17 +210,73 @@ class GroupCacheCluster:
 
         return stats
 
+    async def _handle_peer_request(self, group_name: str, key: str) -> Any | None:
+        """Handle incoming peer requests for cache values (strict ownership model)"""
+        if group_name not in self.groups:
+            logger.debug(f"Peer requested unknown group: {group_name}")
+            return None
+
+        group = self.groups[group_name]
+
+        # Check mainCache first
+        value = group.main_cache.get(key)
+        if value is not None:
+            group.main_cache_hits += 1
+            return value
+
+        # Not in cache - load from source if we have a loader
+        if group.loader:
+            try:
+                group.source_loads += 1
+
+                if asyncio.iscoroutinefunction(group.loader):
+                    value = await group.loader(key)
+                else:
+                    value = group.loader(key)
+
+                if value is not None:
+                    # Cache it in mainCache (we're the owner)
+                    group._populate_cache(key, value, group.main_cache)
+
+                return value
+            except Exception as e:
+                logger.error(f"Error loading from source: {e}")
+
+        return None
+
+    async def start_http_server(self):
+        """Start the HTTP server for peer requests"""
+        if self._server_started:
+            logger.warning("HTTP server already started")
+            return
+
+        # Set the handler and start server (server auto-parses host/port from self_url)
+        self.http_server.set_get_handler(self._handle_peer_request)
+        await self.http_server.start()
+        self._server_started = True
+
+    async def close(self):
+        """Close the cluster and cleanup resources"""
+        if self.peer_client:
+            await self.peer_client.close()
+        if self._server_started:
+            await self.http_server.stop()
+            self._server_started = False
+
 
 class GroupCacheGroup:
     """A cache group within the cluster (matches Go groupcache semantics)"""
 
-    def __init__(self, name: str, cluster: GroupCacheCluster, max_size: int = 10000):
+    def __init__(
+        self,
+        name: str,
+        cluster: GroupCacheCluster,
+        loader: Callable[[str], Any],
+        max_size: int = 10000,
+    ):
         self.name = name
         self.cluster = cluster
-
-        # Go groupcache cache architecture:
-        # mainCache: authoritative data (keys we own via consistent hashing)
-        # hotCache: popular remote data (keys owned by other peers)
+        self.loader = loader  # Single loader for this group (like Go's Getter)
         self.main_cache = LRUCache(max_size)  # Keys this peer is authoritative for
         self.hot_cache = LRUCache(max_size // 10)  # Popular keys from other peers
 
@@ -236,14 +291,11 @@ class GroupCacheGroup:
 
     def _lookup_cache(self, key: str) -> Any | None:
         """Look up key in both mainCache and hotCache (Go groupcache pattern)"""
-
-        # Check mainCache first (authoritative data)
         value = self.main_cache.get(key)
         if value is not None:
             self.main_cache_hits += 1
             return value
 
-        # Check hotCache second (popular remote data)
         value = self.hot_cache.get(key)
         if value is not None:
             self.hot_cache_hits += 1
@@ -251,25 +303,21 @@ class GroupCacheGroup:
 
         return None
 
-    async def get(self, key: str, loader: Callable | None = None) -> Any | None:
+    async def get(self, key: str) -> Any | None:
         """Get value with peer coordination (Go groupcache semantics)"""
-
-        # 1. Look up in both caches (mainCache + hotCache)
         cached_value = self._lookup_cache(key)
         if cached_value is not None:
             return cached_value
 
-        # 2. Use singleflight to prevent duplicate loads
-        return await self.singleflight.do(key, lambda: self._load_key(key, loader))
+        return await self.singleflight.do(key, lambda: self._load_key(key))
 
     def _populate_cache(self, key: str, value: Any, cache: LRUCache) -> None:
         """Populate cache with value (Go groupcache pattern)"""
         cache.set(key, value)
 
-    async def _load_key(self, key: str, loader: Callable | None) -> Any | None:
+    async def _load_key(self, key: str) -> Any | None:
         """Load key from peer or source (Go groupcache semantics)"""
 
-        # Double-check cache (singleflight pattern from Go)
         cached_value = self._lookup_cache(key)
         if cached_value is not None:
             return cached_value
@@ -279,9 +327,12 @@ class GroupCacheGroup:
 
         if owner_peer is None or owner_peer == self.cluster.self_url:
             # We are authoritative for this key - load from source
-            if loader:
+            if self.loader:
                 self.source_loads += 1
-                value = await loader()
+                if asyncio.iscoroutinefunction(self.loader):
+                    value = await self.loader(key)
+                else:
+                    value = self.loader(key)
                 if value is not None:
                     # Store in mainCache (we're authoritative)
                     self._populate_cache(key, value, self.main_cache)
@@ -304,9 +355,12 @@ class GroupCacheGroup:
                 logger.warning(f"Peer request failed: {e}")
 
             # Fallback to local load if peer fails
-            if loader:
+            if self.loader:
                 self.source_loads += 1
-                value = await loader()
+                if asyncio.iscoroutinefunction(self.loader):
+                    value = await self.loader(key)
+                else:
+                    value = self.loader(key)
                 if value is not None:
                     # Store in main cache (fallback makes us authoritative)
                     self._populate_cache(key, value, self.main_cache)
@@ -344,26 +398,35 @@ class GroupCacheGroup:
 
 
 def _make_cache_key(func_name: str, *args, **kwargs) -> str:
-    """Generate cache key using functools._make_key (battle-tested)"""
-    # Prepend function name to args for uniqueness across functions
-    key_args = (func_name,) + args
+    """Generate reversible cache key for distributed caching"""
+    # Create a reversible key by encoding the function call data
+    key_data = {"func": func_name, "args": args, "kwargs": kwargs}
 
-    # Use functools._make_key for optimal performance
-    key = _make_key(key_args, kwargs, typed=False)
+    # Serialize and encode for safe string representation
+    serialized = pickle.dumps(key_data)
+    encoded = base64.urlsafe_b64encode(serialized).decode("ascii")
 
-    # Convert to string for our cache (functools returns various types)
-    if isinstance(key, (str, int)):
-        return str(key)
-    else:
-        return str(hash(key))
+    return f"cached:{encoded}"
 
 
-# Global cluster instance
+def _parse_cache_key(cache_key: str) -> tuple[str, tuple, dict]:
+    """Parse cache key back into function name, args, and kwargs"""
+    if not cache_key.startswith("cached:"):
+        raise ValueError(f"Invalid cache key format: {cache_key}")
+
+    encoded = cache_key[7:]  # Remove "cached:" prefix
+    serialized = base64.urlsafe_b64decode(encoded.encode("ascii"))
+    key_data = pickle.loads(serialized)
+
+    return key_data["func"], key_data["args"], key_data["kwargs"]
+
+
+# Global cluster singleton
 _global_cluster: GroupCacheCluster | None = None
 
 
-def configure_cluster(
-    self_url: str, peer_urls: list[str] | None = None
+async def configure_cluster(
+    self_url: str, peer_urls: list[str] | None = None, auto_start_server: bool = True
 ) -> GroupCacheCluster:
     """Configure the global GroupCache cluster (singleton pattern)"""
     global _global_cluster
@@ -371,6 +434,9 @@ def configure_cluster(
     _global_cluster = GroupCacheCluster(self_url)
     if peer_urls:
         _global_cluster.set_peers(peer_urls)
+
+    if auto_start_server:
+        await _global_cluster.start_http_server()
 
     return _global_cluster
 
@@ -380,10 +446,17 @@ def get_cluster() -> GroupCacheCluster | None:
     return _global_cluster
 
 
+# Store decorated functions for peer requests - all peers have the same functions
+_group_functions: dict[str, tuple[Callable, str]] = {}  # group -> (func, func_name)
+
+
 def cached(group: str):
-    """Decorator for distributed caching (group must already exist)"""
+    """Decorator for distributed caching (Go-style: one loader per group)"""
 
     def decorator(func: Callable) -> Callable:
+        # Register this function for the group
+        _group_functions[group] = (func, func.__name__)
+
         @wraps(func)
         async def wrapper(*args, **kwargs) -> Any:
             if not _global_cluster:
@@ -391,23 +464,45 @@ def cached(group: str):
                     "GroupCache cluster not configured. Call configure_cluster() first."
                 )
 
-            # Get existing cache group (will raise if doesn't exist)
-            cache_group = _global_cluster.get_group(group)
+            # Get or create cache group with this function as the loader
+            try:
+                cache_group = _global_cluster.get_group(group)
+            except ValueError:
+                # Group doesn't exist, create it with this function as the loader
+                async def group_loader(cache_key: str):
+                    """Reconstruct and execute the original function call from cache key"""
+                    try:
+                        # Parse the cache key to extract function call details
+                        func_name, parsed_args, parsed_kwargs = _parse_cache_key(
+                            cache_key
+                        )
+                        registered_func, expected_func_name = _group_functions[group]
 
-            # Generate cache key
+                        # Verify this is the right function
+                        if func_name != expected_func_name:
+                            logger.error(
+                                f"Cache key function {func_name} doesn't match registered function {expected_func_name}"
+                            )
+                            return None
+
+                        # Execute the original function with the parsed arguments
+                        logger.debug(
+                            f"Peer executing: {func_name}({parsed_args}, {parsed_kwargs})"
+                        )
+
+                        if asyncio.iscoroutinefunction(registered_func):
+                            return await registered_func(*parsed_args, **parsed_kwargs)
+                        else:
+                            return registered_func(*parsed_args, **parsed_kwargs)
+
+                    except Exception as e:
+                        logger.error(f"Error in group loader for {group}: {e}")
+                        return None
+
+                cache_group = _global_cluster.create_group(group, group_loader)
+
             key = _make_cache_key(func.__name__, *args, **kwargs)
-
-            # Try to get from distributed cache
-            cached_value = await cache_group.get(key)
-            if cached_value is not None:
-                return cached_value
-
-            # Cache miss - execute function and cache result
-            async def loader():
-                result = await func(*args, **kwargs)
-                return result
-
-            return await cache_group.get(key, loader)
+            return await cache_group.get(key)
 
         return wrapper
 

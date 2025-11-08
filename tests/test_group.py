@@ -3,6 +3,18 @@ import pytest
 from groupcache.groupcache import GroupCacheCluster
 
 
+def dummy_loader(key: str) -> str:
+    """Simple test loader"""
+    return f"value_for_{key}"
+
+
+def selective_loader(key: str) -> str | None:
+    """Test loader that returns None for some keys"""
+    if key in ["missing_key", "key_1"]:  # Keys that tests expect to be None
+        return None
+    return f"value_for_{key}"
+
+
 def create_test_cluster(self_url="localhost:8081"):
     """Helper to create a cluster for testing"""
     cluster = GroupCacheCluster(self_url)
@@ -13,7 +25,7 @@ def create_test_cluster(self_url="localhost:8081"):
 async def test_group_initialization():
     """Test GroupCacheGroup initialization"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group", max_size=1000)
+    group = cluster.create_group("test_group", dummy_loader, max_size=1000)
 
     assert group.name == "test_group"
     assert group.cluster is cluster
@@ -32,7 +44,7 @@ async def test_group_initialization():
 async def test_group_lookup_cache():
     """Test _lookup_cache method"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # Empty cache should return None
     assert group._lookup_cache("key1") is None
@@ -63,7 +75,7 @@ async def test_group_lookup_cache():
 async def test_group_get_cache_hit():
     """Test get() with cache hits"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # Pre-populate main cache
     group.main_cache.set("key1", "value1")
@@ -90,7 +102,7 @@ async def test_group_get_cache_hit():
 async def test_group_get_cache_miss():
     """Test get() with cache misses"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", selective_loader)
 
     # Get non-existent key should return None
     value = await group.get("missing_key")
@@ -106,7 +118,7 @@ async def test_group_get_cache_miss():
 async def test_group_set_local_ownership():
     """Test set() for locally owned keys"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # With no peers, we own all keys
     await group.set("key1", "value1")
@@ -126,7 +138,7 @@ async def test_group_set_remote_ownership():
     """Test set() for remotely owned keys"""
     cluster = create_test_cluster("localhost:8081")
     cluster.set_peers(["localhost:8082", "localhost:8083"])
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # Find a key that we don't own
     test_key = None
@@ -151,7 +163,7 @@ async def test_group_set_remote_ownership():
 async def test_group_get_stats():
     """Test get_stats() method"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group", max_size=100)
+    group = cluster.create_group("test_group", dummy_loader, max_size=100)
 
     # Initial stats
     stats = group.get_stats()
@@ -172,8 +184,8 @@ async def test_group_get_stats():
     await group.get("key3")  # miss
 
     stats = group.get_stats()
-    assert stats["main_cache"]["size"] == 1
-    assert stats["hot_cache"]["size"] == 1
+    assert stats["main_cache"]["size"] == 2  # key1 + key3 (loaded)
+    assert stats["hot_cache"]["size"] == 1  # key2
     assert stats["main_cache_hits"] == 1
     assert stats["hot_cache_hits"] == 1
     assert stats["total_cache_hits"] == 2
@@ -183,7 +195,7 @@ async def test_group_get_stats():
 async def test_group_concurrent_gets():
     """Test concurrent get() calls for same key"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     call_count = 0
 
@@ -226,7 +238,7 @@ async def test_group_peer_request_failure():
     """Test behavior when peer request fails"""
     cluster = create_test_cluster("localhost:8081")
     cluster.set_peers(["localhost:8082"])
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", selective_loader)
 
     # Mock failing peer client
     class FailingPeerClient:
@@ -256,8 +268,8 @@ async def test_group_peer_request_failure():
 async def test_group_cache_isolation():
     """Test that different groups have isolated caches"""
     cluster = create_test_cluster()
-    group1 = cluster.create_group("group1")
-    group2 = cluster.create_group("group2")
+    group1 = cluster.create_group("group1", dummy_loader)
+    group2 = cluster.create_group("group2", dummy_loader)
 
     # Set same key in different groups
     await group1.set("shared_key", "value1")
@@ -276,7 +288,7 @@ async def test_group_cache_isolation():
 async def test_group_populate_cache():
     """Test _populate_cache helper method"""
     cluster = create_test_cluster()
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # Populate main cache
     group._populate_cache("key1", "value1", group.main_cache)
@@ -293,7 +305,7 @@ async def test_group_populate_cache():
 async def test_group_ownership_changes():
     """Test behavior when peer ownership changes"""
     cluster = create_test_cluster("localhost:8081")
-    group = cluster.create_group("test_group")
+    group = cluster.create_group("test_group", dummy_loader)
 
     # Initially no peers - we own everything
     await group.set("key1", "value1")

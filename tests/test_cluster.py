@@ -2,6 +2,11 @@ import pytest
 from groupcache.groupcache import GroupCacheCluster, GroupCacheGroup
 
 
+def dummy_loader(key: str) -> str:
+    """Simple test loader"""
+    return f"value_for_{key}"
+
+
 def test_cluster_initialization():
     """Test GroupCacheCluster initialization"""
     cluster = GroupCacheCluster("localhost:8081")
@@ -50,7 +55,7 @@ def test_cluster_create_group():
     cluster = GroupCacheCluster("localhost:8081")
 
     # Test creating first group
-    group = cluster.create_group("users", max_size=1000)
+    group = cluster.create_group("users", dummy_loader, max_size=1000)
     assert isinstance(group, GroupCacheGroup)
     assert group.name == "users"
     assert group.cluster is cluster
@@ -58,14 +63,14 @@ def test_cluster_create_group():
     assert cluster.groups["users"] is group
 
     # Test creating second group
-    products_group = cluster.create_group("products", max_size=2000)
+    products_group = cluster.create_group("products", dummy_loader, max_size=2000)
     assert products_group.name == "products"
     assert "products" in cluster.groups
     assert len(cluster.groups) == 2
 
     # Test creating group with duplicate name should raise error
     with pytest.raises(ValueError, match="already exists.*get_group"):
-        cluster.create_group("users")
+        cluster.create_group("users", dummy_loader)
 
 
 def test_cluster_get_group():
@@ -77,7 +82,7 @@ def test_cluster_get_group():
         cluster.get_group("nonexistent")
 
     # Create group and test getting it
-    original_group = cluster.create_group("test_group")
+    original_group = cluster.create_group("test_group", dummy_loader)
     retrieved_group = cluster.get_group("test_group")
 
     assert retrieved_group is original_group
@@ -101,8 +106,8 @@ def test_cluster_get_stats():
     assert stats["groups"] == 0
 
     # Add groups and test stats
-    cluster.create_group("users")
-    cluster.create_group("products")
+    cluster.create_group("users", dummy_loader)
+    cluster.create_group("products", dummy_loader)
     stats = cluster.get_stats()
     assert stats["peers"] == 3
     assert stats["groups"] == 2
@@ -120,8 +125,8 @@ def test_cluster_multiple_operations():
 
     # Set up cluster
     cluster.set_peers(["node2:8082", "node3:8083"])
-    users_group = cluster.create_group("users", max_size=1000)
-    products_group = cluster.create_group("products", max_size=500)
+    users_group = cluster.create_group("users", dummy_loader, max_size=1000)
+    products_group = cluster.create_group("products", dummy_loader, max_size=500)
 
     # Verify everything is set up correctly
     assert len(cluster.consistent_hash.get_nodes()) == 3
@@ -166,8 +171,8 @@ def test_cluster_group_isolation():
     cluster = GroupCacheCluster("localhost:8081")
 
     # Create groups with different settings
-    group1 = cluster.create_group("group1", max_size=100)
-    group2 = cluster.create_group("group2", max_size=200)
+    group1 = cluster.create_group("group1", dummy_loader, max_size=100)
+    group2 = cluster.create_group("group2", dummy_loader, max_size=200)
 
     # Verify they have different configurations
     assert group1.main_cache.max_size == 100
@@ -190,7 +195,7 @@ def test_cluster_default_max_size():
     cluster = GroupCacheCluster("localhost:8081")
 
     # Create group without specifying max_size
-    group = cluster.create_group("default_group")
+    group = cluster.create_group("default_group", dummy_loader)
 
     # Should use default value of 10000
     assert group.main_cache.max_size == 10000
