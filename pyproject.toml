@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Distributed cache heavily based on https://github.com/golang/groupcache"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiohttp>=3.13.2",
+]
 
 [dependency-groups]
 dev = [
