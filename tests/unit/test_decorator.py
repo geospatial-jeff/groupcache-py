@@ -61,7 +61,7 @@ async def test_configure_cluster():
     assert cluster is not None
     assert cluster.self_url == "localhost:8081"
     assert get_cluster() is cluster
-    assert len(cluster.consistent_hash.get_nodes()) == 0
+    assert len(cluster.consistent_hash.get_nodes()) == 1  # Only self is added
 
     # Configure with peers
     cluster2 = await configure_cluster(

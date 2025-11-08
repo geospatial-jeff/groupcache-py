@@ -161,6 +161,11 @@ class GroupCacheCluster:
         self.http_server = GroupCacheHTTPServer(base_path, self_url)
         self._server_started = False
 
+    def has_peers(self) -> bool:
+        """Check if cluster has peers beyond self"""
+        all_nodes = self.consistent_hash.get_nodes()
+        return len(all_nodes) > 1
+
     def set_peers(self, peer_urls: list[str]) -> None:
         """Configure cluster peers"""
         # Clear existing nodes
@@ -246,6 +251,12 @@ class GroupCacheCluster:
 
     async def start_http_server(self):
         """Start the HTTP server for peer requests"""
+        if not self.has_peers():
+            logger.info(
+                "No peers configured - skipping HTTP server startup for local-only cache"
+            )
+            return
+
         if self._server_started:
             logger.warning("HTTP server already started")
             return
@@ -325,8 +336,12 @@ class GroupCacheGroup:
         # Determine key owner via consistent hashing
         owner_peer = self.cluster.consistent_hash.get_node(key)
 
-        if owner_peer is None or owner_peer == self.cluster.self_url:
-            # We are authoritative for this key - load from source
+        if (
+            owner_peer is None
+            or owner_peer == self.cluster.self_url
+            or not self.cluster.has_peers()
+        ):
+            # We are authoritative for this key OR no peers configured - load from source
             if self.loader:
                 self.source_loads += 1
                 if asyncio.iscoroutinefunction(self.loader):
@@ -339,7 +354,7 @@ class GroupCacheGroup:
                 return value
             return None
         else:
-            # Request from peer (we're not authoritative)
+            # Request from peer (we're not authoritative and have peers)
             try:
                 self.peer_requests += 1
                 value = await self.cluster.peer_client.get(owner_peer, self.name, key)
@@ -434,6 +449,9 @@ async def configure_cluster(
     _global_cluster = GroupCacheCluster(self_url)
     if peer_urls:
         _global_cluster.set_peers(peer_urls)
+    else:
+        # Add only self to consistent hash for local-only cache
+        _global_cluster.consistent_hash.add_node(self_url)
 
     if auto_start_server:
         await _global_cluster.start_http_server()

@@ -231,8 +231,11 @@ async def test_cluster_http_components_initialization(
 
 @pytest.mark.asyncio
 async def test_cluster_start_http_server_sets_handler():
-    """Test starting HTTP server sets the correct handler"""
+    """Test starting HTTP server sets the correct handler when peers are configured"""
     cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Configure peers to enable HTTP server
+    cluster.set_peers(["http://localhost:8080", "http://localhost:8081"])
 
     # Mock the server start method
     cluster.http_server.start = AsyncMock()
@@ -439,6 +442,9 @@ async def test_group_hot_cache_population(mock_get_node):
     """Test group populates hot cache for peer values"""
     cluster = GroupCacheCluster(self_url="http://localhost:8080")
 
+    # Configure peers to enable peer requests
+    cluster.set_peers(["http://localhost:8080", "http://peer1:8080"])
+
     # Mock consistent hash to return peer URL
     mock_get_node.return_value = "http://peer1:8080"
 
@@ -462,6 +468,9 @@ async def test_group_hot_cache_population(mock_get_node):
 async def test_group_peer_not_found_returns_none(mock_get_node):
     """Test group handles peer returning None"""
     cluster = GroupCacheCluster(self_url="http://localhost:8080")
+
+    # Configure peers to enable peer requests
+    cluster.set_peers(["http://localhost:8080", "http://peer1:8080"])
 
     # Mock consistent hash to return peer URL
     mock_get_node.return_value = "http://peer1:8080"
