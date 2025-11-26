@@ -1,0 +1,27 @@
+[project]
+name = "groupcache-py"
+version = "0.1.0"
+description = "Distributed cache heavily based on https://github.com/golang/groupcache"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.13.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pre-commit>=4.3.0,<5"
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = [
+    "--verbose",
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+pythonpath = ["."]
